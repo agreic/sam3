@@ -3,6 +3,7 @@ import glob
 import argparse
 from pathlib import Path
 
+import cv2
 import torch
 import numpy as np
 import torchvision
@@ -170,8 +171,8 @@ def custom_collate(batch):
 
     return batched_input, metadatas
 
-def save_image_results(base_name, data, output_folder):
-    """Stitches tiles, runs NMS, and saves the final image."""
+def _save_image_results(base_name, data, output_folder):
+    """Stitches tiles, runs NMS, cleans masks (Morphology -> Largest Component), and saves."""
     if not data["boxes"]:
         return
 
@@ -189,39 +190,209 @@ def save_image_results(base_name, data, output_folder):
     keep_indices = torchvision.ops.nms(all_boxes, all_scores, iou_threshold=0.5)
 
     # 4. Filter results
-    final_boxes = all_boxes[keep_indices].cpu().numpy()
-    final_scores = all_scores[keep_indices].cpu().numpy()
-    final_masks = all_masks[keep_indices] # Keep on GPU
+    final_masks = all_masks[keep_indices]
     final_offsets = all_offsets[keep_indices]
+    final_scores = all_scores[keep_indices].cpu().numpy()
+    final_boxes = all_boxes[keep_indices].cpu().numpy()
 
-    # 5. Reconstruct Mask Image (match notebook: 2304x2304, instance-id labels)
+    # 5. Reconstruct Mask Image
     full_mask = torch.zeros((2304, 2304), dtype=torch.int32, device="cuda")
-    
+    valid_indices = []
+
     for i, (mask_tensor, offset) in enumerate(zip(final_masks, final_offsets)):
         if mask_tensor.ndim == 3: mask_tensor = mask_tensor.squeeze(0)
         
+        # Binary mask
         binary_mask = mask_tensor > 0.0 if mask_tensor.min() < 0 else mask_tensor > 0.5
         
+        # Calculate coordinates
         x_start, y_start = int(offset[0]), int(offset[1])
         x_end = min(int(x_start + TILE_SIZE), 2304)
         y_end = min(int(y_start + TILE_SIZE), 2304)
         
         mask_h, mask_w = y_end - y_start, x_end - x_start
-        valid_binary_mask = binary_mask[:mask_h, :mask_w].to(full_mask.device)
+        valid_binary_mask = binary_mask[:mask_h, :mask_w]
+
+        # --- CLEANING STEP (CPU) ---
+        mask_np = valid_binary_mask.cpu().numpy().astype(np.uint8)
+
+        # A. Morphological Opening (The Fix for "Thin Parts")
+        # This breaks thin connections and removes small floating noise
+        kernel_size = 3 
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+        mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_OPEN, kernel)
+
+        # B. Keep Largest Component
+        # Now that bridges are broken, the noise is a separate component we can drop
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
+        if num_labels > 2: # 0 is bg. If > 2, we have multiple objects.
+            # Get largest area (skipping background at index 0)
+            largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            mask_np = (labels == largest_label).astype(np.uint8)
+        elif num_labels < 2:
+            # If opening removed everything, skip this mask
+            continue
+
+        # C. Fill Holes
+        contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(mask_np, contours, -1, 1, thickness=cv2.FILLED)
+
+        # D. Final Area Check (Filter out tiny leftovers)
+        if mask_np.sum() < 50: 
+            continue 
+
+        # Paste back
+        cleaned_mask_tensor = torch.from_numpy(mask_np).to(full_mask.device)
+        valid_indices.append(i)
 
         current_slice = full_mask[y_start:y_end, x_start:x_end]
+        obj_id = len(valid_indices) 
+
         full_mask[y_start:y_end, x_start:x_end] = torch.where(
-            valid_binary_mask, 
-            torch.tensor(i + 1, dtype=torch.int32, device=full_mask.device), 
+            cleaned_mask_tensor > 0, 
+            torch.tensor(obj_id, dtype=torch.int32, device=full_mask.device), 
             current_slice
         )
 
     # 6. Save Files
-    full_mask_np = full_mask.cpu().numpy().astype(np.uint16)
-    Image.fromarray(full_mask_np).save(os.path.join(output_folder, f"{base_name}_masks.png"))
-    np.savetxt(os.path.join(output_folder, f"{base_name}_boxes.txt"), final_boxes, fmt="%.2f")
-    np.savetxt(os.path.join(output_folder, f"{base_name}_scores.txt"), final_scores, fmt="%.4f")
+    final_boxes = final_boxes[valid_indices]
+    final_scores = final_scores[valid_indices]
 
+    if len(valid_indices) > 0:
+        full_mask_np = full_mask.cpu().numpy().astype(np.uint16)
+        Image.fromarray(full_mask_np).save(os.path.join(output_folder, f"{base_name}_masks.png"))
+        np.savetxt(os.path.join(output_folder, f"{base_name}_boxes.txt"), final_boxes, fmt="%.2f")
+        np.savetxt(os.path.join(output_folder, f"{base_name}_scores.txt"), final_scores, fmt="%.4f")
+
+def save_image_results(base_name, data, output_folder):
+    if not data["boxes"]: return
+
+    # Define device explicitly
+    device = torch.device("cuda")
+
+    # 1. Consolidate Data AND Move to GPU
+    # We move inputs to CUDA immediately so NMS and mask checks align with 'full_mask'
+    all_boxes = torch.cat(data["boxes"]).detach().to(device=device, dtype=torch.float32)
+    all_scores = torch.cat(data["scores"]).detach().to(device=device, dtype=torch.float32)
+    all_masks = torch.cat(data["masks"]).detach().to(device=device)
+    all_offsets = torch.cat(data["mask_offsets"]).detach().to(device=device)
+
+    # 2. Standard NMS (Removes identical overlaps)
+    keep_indices = torchvision.ops.nms(all_boxes, all_scores, iou_threshold=0.5)
+    
+    # Filter
+    boxes = all_boxes[keep_indices]
+    scores = all_scores[keep_indices]
+    masks = all_masks[keep_indices]
+    offsets = all_offsets[keep_indices]
+    
+    # Sort descending by score (High Confidence -> Low Confidence)
+    sorted_idx = torch.argsort(scores, descending=True)
+    boxes = boxes[sorted_idx]
+    scores = scores[sorted_idx]
+    masks = masks[sorted_idx]
+    offsets = offsets[sorted_idx]
+
+    # 3. Reconstruct & Clean
+    full_mask = torch.zeros((2304, 2304), dtype=torch.int32, device=device)
+    
+    # We will track which original detections actually made it into the final image
+    valid_indices_map = [] 
+    
+    # CPU buffers for saving later
+    final_scores_list = []
+    final_boxes_list = []
+    
+    for i in range(len(boxes)):
+        mask_tensor = masks[i]
+        if mask_tensor.ndim == 3: mask_tensor = mask_tensor.squeeze(0)
+        
+        # Binary mask for this object
+        binary_mask = mask_tensor > 0.0 if mask_tensor.min() < 0 else mask_tensor > 0.5
+        
+        # Coords
+        offset = offsets[i]
+        x_start, y_start = int(offset[0]), int(offset[1])
+        x_end = min(int(x_start + TILE_SIZE), 2304)
+        y_end = min(int(y_start + TILE_SIZE), 2304)
+        
+        h_slice = y_end - y_start
+        w_slice = x_end - x_start
+        if h_slice <= 0 or w_slice <= 0: continue
+
+        # Get the slice of the CURRENT global mask (what has been painted so far)
+        current_global_slice = full_mask[y_start:y_end, x_start:x_end]
+        
+        # Get the candidate new mask
+        candidate_mask = binary_mask[:h_slice, :w_slice]
+        
+        # --- OCCUPANCY CHECK ---
+        # valid_pixels are pixels that are True in candidate AND 0 in global.
+        # Since everything is on CUDA now, this operation works.
+        valid_pixels = candidate_mask & (current_global_slice == 0)
+        
+        valid_area = valid_pixels.sum().item()
+        total_area = candidate_mask.sum().item()
+        
+        if total_area == 0: continue
+        
+        # Overlap Ratio: How much of this new mask is already "taken" by better masks?
+        overlap_ratio = 1.0 - (valid_area / total_area)
+        
+        # If > 30% of this mask is already covered by a better mask, DROP IT.
+        if overlap_ratio > 0.3: 
+            continue
+            
+        # --- CLEANING THE REMAINDER ---
+        # Move ONLY the valid pixels to CPU for OpenCV cleaning
+        mask_np = valid_pixels.cpu().numpy().astype(np.uint8)
+
+        # Morph Open (Remove thin strands/bridges)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        mask_np = cv2.morphologyEx(mask_np, cv2.MORPH_OPEN, kernel)
+
+        # Keep Largest Component
+        num, labels, stats, _ = cv2.connectedComponentsWithStats(mask_np, connectivity=8)
+        if num > 2:
+            largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+            mask_np = (labels == largest_label).astype(np.uint8)
+        elif num < 2: continue # Empty after cleaning
+
+        # Fill Holes
+        contours, _ = cv2.findContours(mask_np, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        cv2.drawContours(mask_np, contours, -1, 1, thickness=cv2.FILLED)
+
+        # Final Size Check
+        if mask_np.sum() < 50: continue 
+
+        # --- PASTE ---
+        obj_id = len(valid_indices_map) + 1
+        
+        # Move back to GPU for pasting
+        cleaned_mask_tensor = torch.from_numpy(mask_np).to(device)
+        
+        full_mask[y_start:y_end, x_start:x_end] = torch.where(
+            cleaned_mask_tensor > 0, 
+            torch.tensor(obj_id, dtype=torch.int32, device=device), 
+            current_global_slice
+        )
+        
+        valid_indices_map.append(i)
+        # Store box/score for final save
+        final_scores_list.append(scores[i].item())
+        final_boxes_list.append(boxes[i].cpu().numpy())
+
+    # 6. Save Files
+    if len(valid_indices_map) > 0:
+        full_mask_np = full_mask.cpu().numpy().astype(np.uint16)
+        final_boxes_np = np.array(final_boxes_list)
+        final_scores_np = np.array(final_scores_list)
+
+        Image.fromarray(full_mask_np).save(os.path.join(output_folder, f"{base_name}_masks.png"))
+        np.savetxt(os.path.join(output_folder, f"{base_name}_boxes.txt"), final_boxes_np, fmt="%.2f")
+        np.savetxt(os.path.join(output_folder, f"{base_name}_scores.txt"), final_scores_np, fmt="%.4f")
+
+        
 def main():
     parser = argparse.ArgumentParser(
         description="SAM3 High Performance Inference (SEGMENTATION.ipynb as script)"
@@ -306,6 +477,7 @@ def main():
     image_files = sorted(list(set(image_files)))
     # Filter for 'w00' if needed, or remove this line to process everything
     image_files = [i for i in image_files if "w00" in i] 
+    image_files = [i for i in image_files if "241" in i]
     
     print(f"Found {len(image_files)} images.")
 
