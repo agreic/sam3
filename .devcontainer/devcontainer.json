@@ -1,7 +1,7 @@
 {
   "name": "Project SAM3 Dev Container",
   "image": "pytorch/pytorch:2.10.0-cuda13.0-cudnn9-runtime",
-  "runArgs": [ "--gpus", "all", "--name", "pr_sam3" ],
+  "runArgs": [ "--gpus", "all", "--name", "pr_sam3", "--shm-size=16gb" ],
   
   // OPTIONAL: Mount a shared cache so 'uv' doesn't re-download small packages 5 times
   "mounts": [
