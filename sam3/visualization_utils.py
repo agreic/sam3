@@ -254,7 +254,11 @@ def visualize_formatted_frame_output(
         axes = [axes]  # Make it iterable
 
     img = load_frame(video_frames[frame_idx])
-    img_H, img_W, _ = img.shape
+
+    try:
+        img_H, img_W, _ = img.shape
+    except:
+        img_H, img_W = img.shape
 
     for idx in range(num_outputs):
         ax, outputs_set, ax_title = axes[idx], outputs_list[idx], titles[idx]

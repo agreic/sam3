@@ -328,7 +328,7 @@ class CustomCocoDetectionAPI(VisionDataset):
                 f"Number of queries in stage {stage} is {num_queries}, expected {num_queries_per_stage}"
             )
 
-        for query in queries:
+        for query_id, query in enumerate(queries):
             h, w = id2imsize[query["image_id"]]
             if (
                 "input_box" in query

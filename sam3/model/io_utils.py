@@ -171,15 +171,23 @@ def load_video_frames_from_image_folder(
         for p in os.listdir(image_folder)
         if os.path.splitext(p)[-1].lower() in IMAGE_EXTS
     ]
-    try:
-        frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
-    except ValueError:
-        # fallback to lexicographic sort if the format is not "<frame_index>.<img_ext>"
-        logger.warning(
-            f'frame names are not in "<frame_index>.<img_ext>" format: {frame_names[:5]=}, '
-            f"falling back to lexicographic sort."
-        )
-        frame_names.sort()
+
+    frame_names = [img for img in frame_names if "w00" in img]
+    frame_names.sort(key=lambda f: int(re.search(r'_t(\d+)', f).group(1)))
+
+    # Print debug
+    for fn in frame_names[:12]:
+        logger.debug(f"Found frame: {fn}")
+
+    # try:
+    #     frame_names.sort(key=lambda p: int(os.path.splitext(p)[0]))
+    # except ValueError:
+    #     # fallback to lexicographic sort if the format is not "<frame_index>.<img_ext>"
+    #     logger.warning(
+    #         f'frame names are not in "<frame_index>.<img_ext>" format: {frame_names[:5]=}, '
+    #         f"falling back to lexicographic sort."
+    #     )
+    #     frame_names.sort()
     num_frames = len(frame_names)
     if num_frames == 0:
         raise RuntimeError(f"no images found in {image_folder}")
