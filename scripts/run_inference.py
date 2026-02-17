@@ -477,7 +477,7 @@ def main():
     image_files = sorted(list(set(image_files)))
     # Filter for 'w00' if needed, or remove this line to process everything
     image_files = [i for i in image_files if "w00" in i] 
-    image_files = [i for i in image_files if "241" in i]
+    # image_files = [i for i in image_files if "241" in i]
     
     print(f"Found {len(image_files)} images.")
 
